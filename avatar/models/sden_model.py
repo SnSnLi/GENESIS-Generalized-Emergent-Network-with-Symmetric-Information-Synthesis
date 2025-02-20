@@ -54,7 +54,7 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
             dim=dim
         )
         
-        # 4. 知识蒸馏模块(可选)
+        # 4. 知识蒸馏模块
         self.use_distill = use_distill
         if use_distill:
             self.distiller = EmergentKnowledgeDistillation(
@@ -153,7 +153,7 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
         }
 
     def get_features(self):
-        """获取中间特征用于分析或可视化"""
+        
         return {
             'emerged_features': self.emerged_features,
             'topo_features': self.topo_features,
