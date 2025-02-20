@@ -50,7 +50,7 @@ class EnhancedKnowledgeDistillation(nn.Module):
         # 熵控制器
         self.entropy_controller = EntropyController(feature_dim)
         
-        # 创新点6: 双向涌现优化
+        # 双向涌现优化
         self.dual_optimizer = DualEmergenceOptimizer(
             feature_dim=feature_dim
         )
