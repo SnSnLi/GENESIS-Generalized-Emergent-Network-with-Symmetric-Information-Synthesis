@@ -1,4 +1,20 @@
-You are an expert user of knowledge base, and your task is to write code to conduct image retrieval. The schema of this knowledge base includes:
+[FINAL_FEATURES]
+{final_features}
+
+[TOPO_FEATURES]
+{topo_features}
+
+[ADJACENCY_NETWORK]
+{adjacency_network}
+
+
+You are an expert user of knowledge base, and your task is to write code to conduct image retrieval, considering the following aspects:
+1. {final_features}
+2. {topo_features}
+3. {adjacency_network}
+
+
+The schema of this knowledge base includes:
 
 Image data: Each candidate to be retrieved is an image
 Phrases: Each image is associated with a set of phrases
@@ -20,7 +36,13 @@ The given queries include the following patterns:
 
 Task: Given an input query, you should write code to calculate a `node_score_dict` for <topk_test> node IDs, which are input as a list. These node IDs, referred to as `candidate_ids`, are a subset of node IDs from the knowledge base. In `node_score_dict: Dict[int, float]`, each key should be a node ID, and each value should be the corresponding node score. This score should indicate the likelihood of the node being the correct answer to the query. 
 
-Output format: Firstly, you should establish a connection between the given queries and the query patterns to the schema of the knowledge base. Secondly, generate an outline for the code that will compute the scores for all the candidate nodes provided in the query examples. Finally, develop the main function named `get_node_score_dict`, which takes two required parameters: `query` and `candidate_ids`, and optional parameters declared in `parameter_dict`. Note that `parameter_dict` is a dictionary of parameters and their default values where you can declare any parameters or weights used during computing the node scores. If no optional parameters are needed, leave `parameter_dict` as an empty dictionary. Overall, your output should follow the structure:
+Output format: First, based on the provided features:
+- {final_features}: Main semantic and content characteristics
+- {topo_features}: Structural and topological patterns
+- {adjacency_network}: Relationship networks and connections
+Generate an output suggestion that interprets these features in natural language to guide the scoring strategy.
+
+Then, establish a connection between the given queries and the query patterns to the schema of the knowledge base. Next, generate an outline for the code that will compute the scores for all the candidate nodes provided in the query examples, taking the output suggestion as a reference but not strictly dependent on it. Finally, develop the main function named `get_node_score_dict`, which takes two required parameters: `query` and `candidate_ids`, and optional parameters declared in `parameter_dict`. Note that `parameter_dict` is a dictionary of parameters and their default values where you can declare any parameters or weights used during computing the node scores. If no optional parameters are needed, leave `parameter_dict` as an empty dictionary. Overall, your output should follow the structure:
 
 ```python
 # <code outlines>
