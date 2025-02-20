@@ -152,8 +152,7 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
             'topo_features': topo_features
         }
 
-    def get_features(self):
-        
+    def get_features(self):   
         return {
             'emerged_features': self.emerged_features,
             'topo_features': self.topo_features,
