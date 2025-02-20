@@ -27,27 +27,27 @@ class EnhancedKnowledgeDistillation(nn.Module):
         self.teacher = teacher_model
         self.student = student_model
         
-        # 创新点1: 量子涨落感知的特征蒸馏
+        # 量子涨落感知特征蒸馏
         self.quantum_attention = QuantumFluctuationAttention(
             dim=feature_dim,
             heads=num_heads
         )
         
-        # 创新点2: 临界相变感知的特征对齐
+        # 临界相变感知的特征对齐
         self.critical_controller = CriticalDynamicsController(feature_dim)
         
-        # 创新点3: 多尺度涌现特征提取
+        # 多尺度涌现特征提取
         self.emergence_module = MultiScaleEmergenceModule(
             dims=[feature_dim, feature_dim*2, feature_dim*4]
         )
         
-        # 创新点4: 动态拓扑耦合
+        # 动态拓扑耦合
         self.topology_coupler = DynamicTopologyCoupler(
             dim=feature_dim,
             num_heads=num_heads
         )
         
-        # 创新点5: 熵控制器
+        # 熵控制器
         self.entropy_controller = EntropyController(feature_dim)
         
         # 创新点6: 双向涌现优化
