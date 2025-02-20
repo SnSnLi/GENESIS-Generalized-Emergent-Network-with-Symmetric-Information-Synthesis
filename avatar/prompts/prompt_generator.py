@@ -275,27 +275,18 @@ class PromptGenerator:
         
         return prompt
 
-    def generate_avatar_initialize_prompt(self, template_path: str) -> str:
-        """
-        Generate avatar initialize prompt with causal scores
-        
-        Args:
-            template_path: Path to the original template
-        
-        Returns:
-            Generated prompt string with causal scores
-        """
-        # Load base template
-        with open(template_path, 'r') as f:
+    def generate_avatar_initialize_prompt(final_features, topo_features, adjacency_network, output_suggestion):
+
+        with open('avatar_initialize_actions_flickr30k_ent.txt', 'r') as f:
             template = f.read()
+
+        prompt = template.replace('{final_features}', final_features)\
+                        .replace('{topo_features}', topo_features)\
+                        .replace('{adjacency_network}', adjacency_network)\
+                        
+        with open('avatar_initialize_actions_flickr30k_ent.txt', 'w') as f:
+            f.write(prompt)
         
-        # Extract causal insights
-        causal_insights = self._extract_causal_insights()
-        
-        # Update template with causal scores
-        prompt = template.replace('<causal_score>', f"{causal_insights['causal_score']:.2f}")
-        
-        # Return the generated prompt
         return prompt
 
     def generate_improve_actions_prompt(self, template_path: str, feedback: str) -> str:
