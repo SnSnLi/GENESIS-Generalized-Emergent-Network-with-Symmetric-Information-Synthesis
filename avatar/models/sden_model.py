@@ -54,7 +54,7 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
             dim=dim
         )
         
-        # 4. 知识蒸馏模块
+        # 4. 知识蒸馏模块(可选)
         self.use_distill = use_distill
         if use_distill:
             self.distiller = EmergentKnowledgeDistillation(
@@ -116,43 +116,62 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
         
         return logits, optimized_features
         
-    def forward(self, text_features, image_features, labels=None, student_model=None):
-        """完整的前向传播流程"""
-        # 1. 多尺度涌现
-        emerged_features = self.emergence_forward(
-            text_features, image_features
+def forward(self, text_features, image_features, labels=None, student_model=None):
+    # 1. 多尺度涌现
+    emerged_features = self.emergence_forward(
+        text_features, image_features
+    )
+    
+    # 2. 动态拓扑耦合
+    topo_features = self.topology_forward(emerged_features)
+    entropy_ranking = torch.argsort(topo_features['entropy_weights'], dim=-1)
+    # 3. 对偶优化
+    logits, final_features = self.dual_forward(
+        topo_features, labels
+    )
+    
+    # 4. 知识蒸馏(如果启用)
+    if self.training and self.use_distill and student_model is not None:
+        self.distiller.student = student_model
+        distill_output = self.distiller(
+            inputs=(text_features, image_features),
+            labels=labels
         )
-        
-        # 2. 动态拓扑耦合
-        topo_features = self.topology_forward(emerged_features)
-        
-        # 3. 对偶优化
-        logits, final_features = self.dual_forward(
-            topo_features, labels
-        )
-        
-        # 4. 知识蒸馏(如果启用)
-        if self.training and self.use_distill and student_model is not None:
-            self.distiller.student = student_model
-            distill_output = self.distiller(
-                inputs=(text_features, image_features),
-                labels=labels
-            )
-            return {
-                'logits': logits,
-                'features': final_features,
-                'topo_features': topo_features,
-                'distill_loss': distill_output['loss'],
-                'student_logits': distill_output['student_logits']
-            }
-            
         return {
+            # 主要涌现特征 (用于QA检索)
+            'emergence_features': {
+                'final_features': final_features,  # 最终涌现特征，用于主要的语义匹配
+                'emerged_raw': emerged_features,   # 原始涌现特征，用于分析涌现过程
+            },
+            # 辅助检索特征
+            'auxiliary_features': {
+                'topo_features': topo_features['features'],    # 拓扑特征，用于结构相似性匹配
+                'entropy_weights': topo_features['entropy_weights'], # 熵权重，用于特征重要性加权
+                'adjacency': topo_features['adj_matrix'],      # 邻接矩阵，用于关系网络分析
+            },
             'logits': logits,
-            'features': final_features,
-            'topo_features': topo_features
+            'distill_loss': distill_output['loss'],
+            'student_logits': distill_output['student_logits']
         }
+            
+    return {
+        # 主要涌现特征 (用于QA检索)
+        'emergence_features': {
+            'final_features': final_features,  # 最终涌现特征，用于主要的语义匹配
+            'emerged_raw': emerged_features,   # 原始涌现特征，用于分析涌现过程
+        },
+        # 辅助检索特征
+        'auxiliary_features': {
+            'topo_features': topo_features['features'],    # 拓扑特征，用于结构相似性匹配
+            'entropy_weights': topo_features['entropy_weights'], # 熵权重，用于特征重要性加权
+            'adjacency': topo_features['adj_matrix'],      # 邻接矩阵，用于关系网络分析
+            'entropy_ranking': entropy_ranking
+        },
+        'logits': logits
+    }
 
-    def get_features(self):   
+    def get_features(self):
+        """获取中间特征用于分析或可视化"""
         return {
             'emerged_features': self.emerged_features,
             'topo_features': self.topo_features,
