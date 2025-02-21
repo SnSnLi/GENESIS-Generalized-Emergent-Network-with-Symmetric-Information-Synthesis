@@ -10,11 +10,13 @@ from emergence import (
 )
 
 class DualEmergenceOptimizer(nn.Module):
-    def __init__(self, feature_dim, temperature=0.1, alpha=0.5):
+    def __init__(self, feature_dim, temperature=0.1, alpha=0.5, consistency_threshold=0.05, 
+                 patience=3):
         super().__init__()
         self.temperature = temperature
         self.alpha = alpha
-        
+        self.below_threshold_count = 0  
+        self.should_stop = False
         # 复用emergence.py中的核心组件
         self.emergence_core = EmergenceCore(feature_dim)
         self.cross_modal_attention = CrossModalAttention(feature_dim)
@@ -33,6 +35,15 @@ class DualEmergenceOptimizer(nn.Module):
         
         # 双向一致性损失
         self.consistency_loss = SymmetricConsistencyLoss()
+
+    def check_consistency(self, loss_value): 
+        if loss_value < self.consistency_threshold:
+            self.below_threshold_count += 1
+            if self.below_threshold_count >= self.patience:
+                self.should_stop = True
+        else:
+            self.below_threshold_count = 0
+        return self.should_stop
 
     def forward(self, text_features, image_features):
         # 1. E-Step: 估计分布
@@ -56,7 +67,8 @@ class DualEmergenceOptimizer(nn.Module):
         emergence_state = torch.sigmoid(emergence_state)
         emergence_weighted_loss = consistency_loss * emergence_state
         
-        return text_emerged, image_emerged, emergence_weighted_loss
+        should_stop = self.check_consistency(consistency_loss.item()
+        return text_emerged, image_emerged, emergence_weighted_loss, consistency_loss, should_stop
 
 
 class CriticalDistributionEstimator(nn.Module):
