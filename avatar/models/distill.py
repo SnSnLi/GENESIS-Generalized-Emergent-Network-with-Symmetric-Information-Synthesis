@@ -55,7 +55,6 @@ class EnhancedKnowledgeDistillation(nn.Module):
             feature_dim=feature_dim
         )
         
-        # 自适应温度参数
         self.temperature = nn.Parameter(torch.ones(1))
         
         # 多任务权重
