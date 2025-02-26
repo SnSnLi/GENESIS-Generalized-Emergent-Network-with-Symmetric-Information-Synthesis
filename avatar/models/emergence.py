@@ -55,7 +55,7 @@ class MultiHeadAttention(nn.Module):
         return self.proj(out), attn
 
 class PhaseTransitionLayer(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, noise_scale=0.1):
         super().__init__()
         self.energy_net = nn.Sequential(
             nn.Linear(dim*2, dim*4),
@@ -65,26 +65,36 @@ class PhaseTransitionLayer(nn.Module):
             nn.GELU(),
             nn.Linear(dim*2, 1)
         )
-        self.temperature = nn.Parameter(torch.ones(dim) * 0.1)  # 改为向量
+        self.temperature = nn.Parameter(torch.ones(dim) * 0.1)  # 可学习温度参数
+        self.noise_scale = noise_scale  # 控制量子噪声幅度
         
     def forward(self, text_feat, image_feat):
         joint_feat = torch.cat([text_feat, image_feat], dim=-1)
         energy = self.energy_net(joint_feat) / self.temperature.view(1, 1, -1)
-        return torch.sigmoid(energy)
+        phase = torch.sigmoid(energy)  # 阶段状态，0-1之间
+        
+        # 量子波动：低能量时注入受控噪声（仅在训练时）
+        if self.training:
+            noise_mask = (phase < 0.5).float()  # 能量低于阈值时触发
+            noise = torch.randn_like(text_feat) * self.noise_scale * noise_mask.expand_as(text_feat)
+            text_feat = text_feat + noise
+            image_feat = image_feat + noise  # 双向噪声注入
+        
+        return phase, text_feat, image_feat  # 返回阶段状态和扰动后的特征
 
 class LocalFeatureAligner(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, noise_scale=0.1):
         super().__init__()
-        self.phase_transition = PhaseTransitionLayer(dim)
+        self.phase_transition = PhaseTransitionLayer(dim, noise_scale)
         self.cross_attention = CrossModalAttention(dim)
         
     def forward(self, text_feat, image_feat):
-        energy = self.phase_transition(text_feat, image_feat)
-        aligned_feat = self.cross_attention(text_feat, image_feat)
-        return aligned_feat * energy.expand_as(aligned_feat)  # 确保维度匹配
+        phase, text_feat_perturbed, image_feat_perturbed = self.phase_transition(text_feat, image_feat)
+        aligned_feat = self.cross_attention(text_feat_perturbed, image_feat_perturbed)
+        return aligned_feat * phase.expand_as(aligned_feat)  # 能量调制
 
 class DynamicTopoNet(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, noise_scale=0.1):
         super().__init__()
         self.graph_gen = nn.Sequential(
             nn.Linear(dim, dim*2),
@@ -93,11 +103,19 @@ class DynamicTopoNet(nn.Module):
             nn.Linear(dim*2, dim)
         )
         self.attention = nn.MultiheadAttention(dim, num_heads=8)
+        self.noise_scale = noise_scale  # 量子噪声幅度
         
     def forward(self, x):
+        # 自注意力生成初始特征
         x_permuted = x.permute(1, 0, 2)
         attn_out, _ = self.attention(x_permuted, x_permuted, x_permuted)
         attn_out = attn_out.permute(1, 0, 2)
+        
+        # 量子波动：注入噪声增强拓扑适应性（仅训练时）
+        if self.training:
+            noise = torch.randn_like(attn_out) * self.noise_scale
+            attn_out = attn_out + noise
+        
         gen_out = self.graph_gen(attn_out)
         adj_matrix = torch.matmul(gen_out, gen_out.transpose(-2, -1))  # 双向图
         return F.softmax(adj_matrix, dim=-1)
@@ -117,9 +135,9 @@ class EntropyGateLayer(nn.Module):
         return graph * gate
 
 class SemanticGraphBuilder(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, noise_scale=0.1):
         super().__init__()
-        self.dynamic_topology = DynamicTopoNet(dim)
+        self.dynamic_topology = DynamicTopoNet(dim, noise_scale)
         self.entropy_gate = EntropyGateLayer(dim)
         
     def forward(self, local_feat):
@@ -158,17 +176,18 @@ class EmergencePredictor(nn.Module):
         return self.predictor(critical_state)
 
 class EmergenceCore(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, noise_scale=0.1):
         super().__init__()
-        self.phase_transition = PhaseTransitionLayer(dim)
+        self.phase_transition = PhaseTransitionLayer(dim, noise_scale)
         self.critical_transformer = CriticalTransformer(dim)
         self.emergence_predictor = EmergencePredictor(dim)
         self.cross_modal = CrossModalAttention(dim)
         
     def forward(self, x, context=None):
         if context is not None:
-            phase_state = self.phase_transition(x, context).expand_as(x)
-            x = x * phase_state
+            phase_state, x_perturbed, context_perturbed = self.phase_transition(x, context)
+            x = x_perturbed * phase_state.expand_as(x)
+            context = context_perturbed
         critical_state = self.critical_transformer(x)
         if context is not None:
             critical_state = self.cross_modal(critical_state, context)
@@ -200,10 +219,10 @@ class ScaleInteractionModule(nn.Module):
         return self.mlp(concat_feats)
 
 class BidirectionalEmergenceCore(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, noise_scale=0.1):
         super().__init__()
-        self.text_emergence = EmergenceCore(dim)
-        self.image_emergence = EmergenceCore(dim)
+        self.text_emergence = EmergenceCore(dim, noise_scale)
+        self.image_emergence = EmergenceCore(dim, noise_scale)
         self.cross_modal = CrossModalAttention(dim)
         self.fusion = nn.Sequential(
             nn.Linear(dim*2, dim*2),
@@ -212,8 +231,8 @@ class BidirectionalEmergenceCore(nn.Module):
         )
         
     def forward(self, text_feat, image_feat):
-        text_emerged = self.text_emergence(text_feat)
-        image_emerged = self.image_emergence(image_feat)
+        text_emerged = self.text_emergence(text_feat, image_feat)
+        image_emerged = self.image_emergence(image_feat, text_feat)
         text_context = self.cross_modal(text_emerged, image_emerged)
         image_context = self.cross_modal(image_emerged, text_emerged)
         text_final = self.fusion(torch.cat([text_emerged, text_context], dim=-1))
@@ -221,12 +240,12 @@ class BidirectionalEmergenceCore(nn.Module):
         return text_final, image_final
 
 class MultiScaleEmergenceModule(nn.Module):
-    def __init__(self, dims):
+    def __init__(self, dims, noise_scale=0.1):
         super().__init__()
-        self.micro_layer = LocalFeatureAligner(dims[0])
-        self.meso_layer = SemanticGraphBuilder(dims[1])
+        self.micro_layer = LocalFeatureAligner(dims[0], noise_scale)
+        self.meso_layer = SemanticGraphBuilder(dims[1], noise_scale)
         self.macro_layer = GlobalEmergenceLayer(dims[2])
-        self.bidirectional = BidirectionalEmergenceCore(dims[2])
+        self.bidirectional = BidirectionalEmergenceCore(dims[2], noise_scale)
         self.scale_interaction = ScaleInteractionModule(dims)
         self.micro_to_meso = nn.Linear(dims[0], dims[1])
         
@@ -241,12 +260,12 @@ class MultiScaleEmergenceModule(nn.Module):
         return final_text, final_image, global_emerged
 
 class EmergenceModel(nn.Module):
-    def __init__(self, dim=512, text_input_dim=768, image_input_dim=1024, num_classes=None, modality_dims=None):
+    def __init__(self, dim=512, text_input_dim=768, image_input_dim=1024, num_classes=None, modality_dims=None, noise_scale=0.1):
         super().__init__()
         if modality_dims is None:
             modality_dims = {'text': text_input_dim, 'image': image_input_dim}
         self.projections = nn.ModuleDict({k: nn.Linear(v, dim) for k, v in modality_dims.items()})
-        self.multi_scale = MultiScaleEmergenceModule([dim, dim*2, dim*4])
+        self.multi_scale = MultiScaleEmergenceModule([dim, dim*2, dim*4], noise_scale)
         
         # 可选的任务头（例如分类）
         self.num_classes = num_classes
@@ -273,4 +292,3 @@ class EmergenceModel(nn.Module):
     def consistency_loss(self, final_text, final_image):
         """辅助损失：鼓励跨模态一致性"""
         return -F.cosine_similarity(final_text.mean(dim=1), final_image.mean(dim=1)).mean()
-
