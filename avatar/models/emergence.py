@@ -266,8 +266,8 @@ class EmergenceModel(nn.Module):
             modality_dims = {'text': text_input_dim, 'image': image_input_dim}
         self.projections = nn.ModuleDict({k: nn.Linear(v, dim) for k, v in modality_dims.items()})
         self.multi_scale = MultiScaleEmergenceModule([dim, dim*2, dim*4], noise_scale)
+        self.emergence_core = EmergenceCore(dim, noise_scale)  # 新增共享的 EmergenceCore
         
-        # 可选的任务头（例如分类）
         self.num_classes = num_classes
         if num_classes:
             self.classifier = nn.Linear(dim*4, num_classes)
@@ -283,11 +283,27 @@ class EmergenceModel(nn.Module):
         
         final_text, final_image, global_emerged = self.multi_scale(feats['text'], feats['image'])
         
+        if self.training:
+            # 计算一致性损失，确保单模态和多模态特征对齐
+            consistency_loss = self.consistency_loss(final_text, final_image)
+        
         if self.num_classes:
-            cls_input = global_emerged.mean(dim=1)  # 池化
+            cls_input = global_emerged.mean(dim=1)
             logits = self.classifier(cls_input)
-            return final_text, final_image, global_emerged, logits
+            return final_text, final_image, global_emerged, logits, consistency_loss if self.training else None
         return final_text, final_image, global_emerged
+    
+    def forward_text(self, text_feat):
+        """单模态文本涌现"""
+        feat = self.projections['text'](text_feat)
+        emerged = self.emergence_core(feat)  # 使用共享的 EmergenceCore
+        return emerged
+    
+    def forward_image(self, image_feat):
+        """单模态图像涌现"""
+        feat = self.projections['image'](image_feat)
+        emerged = self.emergence_core(feat)  # 使用共享的 EmergenceCore
+        return emerged
     
     def consistency_loss(self, final_text, final_image):
         """辅助损失：鼓励跨模态一致性"""
