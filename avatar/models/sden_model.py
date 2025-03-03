@@ -24,22 +24,16 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
         self.dim = dim
         self.temperature = temperature
         
-        # 1. 多尺度涌现模块
-        self.emergence_module = MultiScaleEmergenceModule(
-            dims=[dim, dim*2, dim*4]
-        )
+        self.emergence_module = MultiScaleEmergenceModule(dims=[dim, dim*2, dim*4])
         self.bidirectional_core = BidirectionalEmergenceCore(dim=dim)
         self.cross_modal = CrossModalAttention(dim=dim)
         
-        # 2. 动态拓扑耦合模块
         self.topology_coupler = DynamicTopologyCoupler(dim=dim, num_heads=num_heads)
         self.entropy_controller = EntropyController(dim=dim)
         self.critical_controller = CriticalDynamicsController(dim=dim)
         
-        # 3. 对偶优化模块
         self.dual_optimizer = DualEmergenceOptimizer(dim=dim)
         
-        # 4. 输出头
         self.classifier = nn.Linear(dim, dim)
 
     def emergence_forward(self, text_features, image_features):
@@ -67,15 +61,18 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
         return logits, optimized_features
         
     def forward(self, text_features, image_features, labels=None):
-        # 1. 多尺度涌现
         emerged_features = self.emergence_forward(text_features, image_features)
-        
-        # 2. 动态拓扑耦合
         topo_features = self.topology_forward(emerged_features)
         entropy_ranking = torch.argsort(topo_features['entropy_weights'], dim=-1)
-        
-        # 3. 对偶优化
         logits, final_features = self.dual_forward(topo_features, labels)
+        
+        if self.training:
+            # 计算一致性损失
+            text_emerged = self.forward_text(text_features)
+            image_emerged = self.forward_image(image_features)
+            consistency_loss = -F.cosine_similarity(text_emerged.mean(dim=1), image_emerged.mean(dim=1)).mean()
+        else:
+            consistency_loss = None
         
         return {
             'emergence_features': {
@@ -88,8 +85,19 @@ class SymmetricDynamicEmergenceNetwork(nn.Module):
                 'adjacency': topo_features['adj_matrix'],
                 'entropy_ranking': entropy_ranking
             },
-            'logits': logits
+            'logits': logits,
+            'consistency_loss': consistency_loss
         }
+
+    def forward_text(self, text_features):
+        """单模态文本涌现"""
+        text_emerged = self.bidirectional_core.text_emergence(text_features)  # 使用 BidirectionalEmergenceCore 的单模态部分
+        return text_emerged
+    
+    def forward_image(self, image_features):
+        """单模态图像涌现"""
+        image_emerged = self.bidirectional_core.image_emergence(image_features)  # 使用 BidirectionalEmergenceCore 的单模态部分
+        return image_emerged
 
     def get_features(self):
         """获取中间特征用于分析或可视化"""
