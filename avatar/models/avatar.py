@@ -24,7 +24,7 @@ from stark_qa.tools.io import read_from_file, write_to_file
 from avatar.utils.timer import exit_after
 from stark_qa.skb import SKB
 from stark_qa.tools.api import get_llm_output
-
+from avatar.models.sden_model import SymmetricDynamicEmergenceNetwork
 
 class MemoryBank:
     def __init__(self, memory_types: List[str], file_path: str = None):
@@ -55,7 +55,6 @@ class MemoryBank:
 
 
 class AvaTaR(ModelForQA): 
-  
     def __init__(self, 
                  kb: Any,
                  emb_model: str,
@@ -71,29 +70,14 @@ class AvaTaR(ModelForQA):
                  topk_test: int = 200,
                  num_processes: int = 4,
                  dataset: str = 'amazon',
-                 time_limit_unit: int = 20
+                 time_limit_unit: int = 20,
+                 dim: int = 512,  # 模型参数
+                 num_heads: int = 8,
+                 num_layers: int = 4,
+                 temperature: float = 0.1,
+                 use_cuda: bool = True  # 是否使用 GPU
                  ):
-        """
-        Initialize the AvaTaR class.
-
-        Args:
-            kb (Any): The knowledge base object.
-            agent_llm (str): The model name or path for the actions generator.
-            api_func_llm (str): The model name or path for the LLM function model.
-            output_dir (str): The directory where outputs will be saved.
-            chunk_size (int): The size of text chunks for processing.
-            node_emb_dir (str): The directory where node embeddings are stored.
-            query_emb_dir (str): The directory where query embeddings are stored.
-            chunk_emb_dir (str): The directory where chunk embeddings are stored.
-            n_limit (int, optional): The maximum number of iterations or calls. Default is 50.
-            topk_test (int, optional): The number of initial candidates to consider. Default is 200.
-            num_processes (int, optional): The number of processes to use for parallel processing. Default is 4.
-            dataset (str, optional): The name of the dataset being used. Default is 'amazon'.
-            time_limit_unit (int, optional): The time limit unit to constrain the execution time 
-        """
-
         super().__init__(kb=kb)
-        # Initialize class variables
         self.kb = kb
         self.emb_model = emb_model
         self.agent_llm = agent_llm
@@ -109,29 +93,41 @@ class AvaTaR(ModelForQA):
         self.num_processes = num_processes
         self.dataset = dataset
         self.time_limit_unit = time_limit_unit
+        self.use_cuda = use_cuda
 
-        ###########################################################
-        #                    Modulize components                  # 
-        ###########################################################
-        # preprocessor for grouping queries (only once)
+        # 模板缓存和备份
+        self.template_cache = {}
+        self.template_backup = {}
+        self.template_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'prompts')
+
+        # 初始化模型
+        self.model = SymmetricDynamicEmergenceNetwork(
+            dim=dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            temperature=temperature
+        )
+        self.feature_extractor = CLIPFeatureExtractorTool(
+            emb_model=emb_model,
+            batch_size=clip_batch_size,
+            use_cuda=use_cuda
+        )
+                # 移动到设备
+        self.device = torch.device('cuda' if self.use_cuda and torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+
         self.preprocessor = partial(get_llm_output, model=self.api_func_llm, 
                                     json_object=True, max_tokens=4096, temperature=0.5)
-        # actor for producing actions
         self.actor = partial(get_llm_output, model=self.agent_llm, temperature=1)
-        # comparator for generating instructions for the actor
         self.comparator = partial(get_llm_output, model=self.agent_llm, temperature=1)
 
-        # Initialize parent VSS model
         self.parent_pred_path = None
         self.parent_vss = VSS(kb, query_emb_dir, node_emb_dir, emb_model=emb_model)
-
-        # Set up debug print paths
         self.debug_print_dir = osp.join(output_dir, 'debug_print')
         self.debug_print_path = osp.join(self.debug_print_dir, f'{os.getpid()}.txt')
         os.makedirs(self.debug_print_dir, exist_ok=True)
-
-        # Initialize APIs
         self.APIs = self._get_APIs()
+        
     
     def _load_actions(self, group_idx: int, seed: int = 20) -> Union[str, Dict]:
         group_output_dir = osp.join(self.output_dir, f'group_{group_idx}', f'seed_{seed}')
@@ -162,8 +158,7 @@ class AvaTaR(ModelForQA):
         }
         variables = {}
         for api in apis:
-            assert api in available_funcs, f'API {api} is not available for this dataset!' \
-                   ' Please either remove it from assignment or add it to registered/customized functions!'
+            assert api in available_funcs, f'API {api} is not available for this dataset!'
             func = available_funcs[api](**kwargs_union)
             variables[api] = func
             if api == 'debug_print':
@@ -173,8 +168,47 @@ class AvaTaR(ModelForQA):
         variables.update({'exit_after': exit_after})
         return variables
 
-    def _get_prompt(self, name: str = 'initialize_actions', **kwargs: Any) -> str:
-        
+    def _load_template(self, template_name: str) -> str:
+        """加载模板文件并缓存（从 PromptGenerator 引入）"""
+        template_path = osp.join(self.template_dir, f"avatar_{template_name}.txt")
+        try:
+            if template_path not in self.template_cache:
+                with open(template_path, 'r') as f:
+                    self.template_cache[template_path] = f.read()
+            return self.template_cache[template_path]
+        except FileNotFoundError:
+            print(f"模板文件未找到: {template_path}")
+            raise
+        except IOError as e:
+            print(f"读取模板失败: {str(e)}")
+            raise
+
+    def _backup_template(self, template_name: str) -> None:
+        """备份原始模板内容（从 PromptGenerator 引入）"""
+        template_path = osp.join(self.template_dir, f"avatar_{template_name}.txt")
+        try:
+            with open(template_path, 'r') as f:
+                self.template_backup[template_name] = f.read()
+        except IOError as e:
+            print(f"备份模板失败: {str(e)}")
+
+    def _restore_template(self, template_name: str) -> None:
+        """恢复原始模板内容（从 PromptGenerator 引入）"""
+        template_path = osp.join(self.template_dir, f"avatar_{template_name}.txt")
+        if template_name in self.template_backup:
+            try:
+                with open(template_path, 'w') as f:
+                    f.write(self.template_backup[template_name])
+            except IOError as e:
+                print(f"恢复模板失败: {str(e)}")
+
+    def _validate_template(self, prompt: str) -> bool:
+        """验证模板完整性（从 PromptGenerator 引入）"""
+        required_placeholders = {'{final_features}', '{emerged_raw}'}
+        present_placeholders = set(re.findall(r'{\w+}', prompt))
+        return required_placeholders.issubset(present_placeholders)
+
+def _get_prompt(self, name: str = 'initialize_actions', **kwargs: Any) -> str:
         prompt_path = {
             'initialize_actions_stark': 'prompts/avatar_initialize_actions_stark.txt',
             'initialize_actions_flickr30k_ent': 'prompts/avatar_initialize_actions_flickr30k_ent.txt',
@@ -184,17 +218,38 @@ class AvaTaR(ModelForQA):
             'initialize_group': 'prompts/preprocess_group_initialization.txt'
         }
         current_dir = osp.dirname(osp.abspath(__file__))
-        prompt_path = {key: osp.join(current_dir, '..', path) \
-            for key, path in prompt_path.items()}
+        prompt_path = {key: osp.join(current_dir, '..', path) for key, path in prompt_path.items()}
+
+        if name in prompt_path:
+            prompt = self._load_template(name)
+        else:
+            raise ValueError(f"Unknown prompt name: {name}")
+
+    # 获取特征（需确保 text_features 和 image_features 已提供）
+        text_features = kwargs.get('text_features')
+        image_features = kwargs.get('image_features')
+        if text_features is not None and image_features is not None:
+            # 移动到设备
+            text_features = text_features.to(self.device)
+            image_features = image_features.to(self.device)
+            output = self.model.forward(text_features, image_features)
+        else:
+            output = None
 
         if name == 'comparator':
-            prompt = read_from_file(prompt_path[name])
-            pos_neg_queries = kwargs['pos_neg_queries']
+            pos_neg_queries = kwargs.get('pos_neg_queries', '')
             prompt = prompt.replace('<pos_neg_queries>', pos_neg_queries)
+            
+            # 支持 PromptGenerator 的占位符
+            final_features = kwargs.get('final_features', '')
+            emerged_raw = kwargs.get('emerged_raw', '')
+            entropy_weights = kwargs.get('entropy_weights', '')
+            prompt = prompt.replace('{final_features}', final_features)\
+                          .replace('{emerged_raw}', emerged_raw)\
+                          .replace('{entropy_weights}', entropy_weights)
 
-        if name == 'initialize_group':
-            prompt = read_from_file(prompt_path[name])
-            example_queries = kwargs['example_queries']
+        elif name == 'initialize_group':
+            example_queries = kwargs.get('example_queries', '')
             prompt = prompt.replace('<node_types>', str(self.kb.node_type_lst()))
             prompt = prompt.replace('<edge_types>', str(self.kb.rel_type_lst()))
             prompt = prompt.replace('<relational_tuples>', str(self.kb.get_tuples()))
@@ -203,10 +258,10 @@ class AvaTaR(ModelForQA):
 
         elif name == 'initialize_actions':
             if isinstance(self.kb, SKB):
-                prompt = read_from_file(prompt_path['initialize_actions_stark'])
-                sample_indices = kwargs['sample_indices']
-                qa_dataset = kwargs['qa_dataset']
-                pattern = kwargs['pattern']
+                prompt = self._load_template('initialize_actions_stark')
+                sample_indices = kwargs.get('sample_indices', [])
+                qa_dataset = kwargs.get('qa_dataset', None)
+                pattern = kwargs.get('pattern', '')
                 func_call_description = '\n'.join(['- ' + func.func_format + '. ' + func.description for func in self.funcs])
                 example_queries = '\n'.join([f'Q{i+1}: ' + qa_dataset[idx][0] for i, idx in enumerate(sample_indices)])
                 prompt = prompt.replace('<node_types>', str(self.kb.node_type_lst()))
@@ -220,24 +275,28 @@ class AvaTaR(ModelForQA):
                 prompt = prompt.replace('<pattern>', pattern)
                 prompt = prompt.replace('<example_queries>', example_queries)
             elif self.dataset == 'flickr30k_entities':
-                prompt = read_from_file(prompt_path['initialize_actions_flickr30k_ent'])
-                sample_indices = kwargs['sample_indices']
-                qa_dataset = kwargs['qa_dataset']
-                pattern = kwargs['pattern']
+                prompt = self._load_template('initialize_actions_flickr30k_ent')
+                sample_indices = kwargs.get('sample_indices', [])
+                qa_dataset = kwargs.get('qa_dataset', None)
+                pattern = kwargs.get('pattern', '')
                 func_call_description = '\n'.join(['- ' + func.func_format + '. ' + func.description for func in self.funcs])
                 example_queries = '\n'.join([f'Q{i+1}: ' + qa_dataset[idx][0] for i, idx in enumerate(sample_indices)])
-
                 prompt = prompt.replace('<topk_test>', str(self.topk_test))
                 prompt = prompt.replace('<func_call_description>', func_call_description)
                 prompt = prompt.replace('<pattern>', pattern)
                 prompt = prompt.replace('<example_queries>', example_queries)
 
+                if output:
+                    final_features = str(output['emergence_features']['final_features'])
+                    topo_features = str(output['auxiliary_features']['topo_features'])
+                    prompt = prompt.replace('{final_features}', final_features)\
+                                  .replace('{topo_features}', topo_features)
+
         elif name == 'improve_actions':
-            prompt = read_from_file(prompt_path[name])
-            debug_message = kwargs['debug_message']
-            feedback_message = kwargs['feedback_message']
-            query = kwargs['query']
-            candidate_ids = kwargs['candidate_ids']
+            debug_message = kwargs.get('debug_message', '')
+            feedback_message = kwargs.get('feedback_message', '')
+            query = kwargs.get('query', '')
+            candidate_ids = kwargs.get('candidate_ids', [])
             debug_message = debug_message.strip(' \n')
             prompt = prompt.replace('<debug_message>', '"\n' + debug_message + '\n"' if len(debug_message) else 'No output')
             prompt = prompt.replace('<feedback_message>', feedback_message)
@@ -245,40 +304,53 @@ class AvaTaR(ModelForQA):
             prompt = prompt.replace('<size_of_candidate_ids>', str(len(candidate_ids)) if len(candidate_ids) else 'Not specified')
 
         elif name == 'assign_group':
-            prompt = read_from_file(prompt_path[name])
-            query = kwargs['query']
-            group_patterns = kwargs['group_patterns']
+            query = kwargs.get('query', '')
+            group_patterns = kwargs.get('group_patterns', '')
             prompt = prompt.replace('<query>', query)
             prompt = prompt.replace('<group_patterns>', group_patterns)
 
+        # 验证模板完整性
+        if not self._validate_template(prompt):
+            print("生成模板可能不完整，缺少必要占位符")
+
         return prompt
 
+    def generate_comparator_prompt(self, final_features: str, emerged_raw: str, entropy_weights: str) -> str:
+        """生成 comparator 提示（从 PromptGenerator 引入）"""
+        self._backup_template('comparator')  # 备份模板
+        prompt = self._get_prompt(name='comparator', final_features=final_features, emerged_raw=emerged_raw, entropy_weights=entropy_weights)
+        
+        # 写入文件（保持原逻辑）
+        with open(osp.join(self.template_dir, 'avatar_comparator.txt'), 'w') as f:
+            f.write(prompt)
+        
+        return prompt
+
+    def generate_avatar_initialize_prompt(self, final_features: str, topo_features: str) -> str:
+        """生成 initialize 提示（从 PromptGenerator 引入）"""
+        self._backup_template('initialize_actions_flickr30k_ent')  # 备份模板
+        prompt = self._get_prompt(name='initialize_actions', final_features=final_features, topo_features=topo_features)
+        
+        # 写入文件（保持原逻辑）
+        with open('avatar_initialize_actions_flickr30k_ent.txt', 'w') as f:
+            f.write(prompt)
+        
+        return prompt
+
+    # 以下为原有的方法，保持不变
     def _parse_output_to_actions(self, output: str, time_limit: int = None) -> str:
-        '''
-        Extract the actions from the output of the actions generator.
-        '''
         assert len(output.split('```')) == 3, 'The output should contain only one actions block wrapped by a pair of "```"!'
         actions = output.split('```')[1]
-        # remove 'python'
         if actions.startswith('python'):
             actions = actions[len('python'):]
-
-        # extract the main function get_node_score_dict
         str_func = 'def get_node_score_dict'
-        # assert str_func in output, f'The output should contain function {str_func}!'
-
-        # add time limit
         if time_limit:
             actions = actions.replace(str_func, f"@exit_after({time_limit})\n" + str_func)
         else:
-            # remove “@exit_after(xxx)"
-            actions = re.sub(r"@exit_after\(\d+\)", "", actions)
+            actions = re.sub(r"@exit_after$$ \d+ $$", "", actions)
         return actions
 
     def _exec_actions_from_output(self, output: str, time_limit: int = None) -> Union[bool, str, str]:
-        '''
-        Execute the actions from the output of the actions generator.
-        '''
         fail_exec = False
         fail_exec_info = None
         actions = None
@@ -312,10 +384,6 @@ class AvaTaR(ModelForQA):
                          metrics: List[str] = ['hit@5', 'recall@20'], 
                          sel_metric: str = 'MRR', 
                          verbose: bool = True):
-        
-        ###########################################################
-        #            Initialize global state and APIs             #
-        ###########################################################
         def freeze_global() -> List[str]:
             return copy.deepcopy(list(globals().keys()))
 
@@ -331,7 +399,6 @@ class AvaTaR(ModelForQA):
                 print(f'Remove keys {reset_keys} in globals()')
             reset_APIs()
 
-        # load group assignment
         if use_group:
             group_train, patterns = self.load_group(surfix='train')
             group_val, patterns = self.load_group(surfix='val')
@@ -342,7 +409,6 @@ class AvaTaR(ModelForQA):
             pattern = 'NA'
         random.shuffle(train_indices)
 
-        # prepare for the output directory
         print(f'Generating for seed {seed}...')
         if use_group:
             output_dir = osp.join(self.output_dir, f'group_{group_idx}')
@@ -360,13 +426,9 @@ class AvaTaR(ModelForQA):
         memory_bank_path = osp.join(actions_output_dir, 'memory_bank.json')
         metadata_path = osp.join(actions_output_dir, f'metadata.json')
         
-        # initialize variables
         global parameter_dict
         global get_node_score_dict
         
-        ###########################################################
-        #                     Initialize actions                  #
-        ###########################################################
         def get_initial_prompt() -> str:
             sample_indices = random.sample(train_indices, min(n_examples, len(train_indices)))
             prompt = self._get_prompt(
@@ -390,9 +452,6 @@ class AvaTaR(ModelForQA):
                 prompt = get_initial_prompt()
                 output = read_from_file(initial_actions_path)
             else:
-                ###########################################################
-                #                 Generate initial actions                #
-                ###########################################################
                 output, prompt = initialize_actions()
                 write_to_file(initial_actions_path, output)
             if verbose:
@@ -401,9 +460,6 @@ class AvaTaR(ModelForQA):
             curr_log = [{"role": "user", "content": prompt},
                         {"role": "assistant", "content": output}]
         else:
-            ###########################################################
-            #                        Resume                           #
-            ###########################################################
             metadata = read_from_file(metadata_path)
             step, best_step = metadata['step'], metadata['best_step']
             gap_from_last_improv = metadata['gap_from_last_improv']
@@ -415,9 +471,6 @@ class AvaTaR(ModelForQA):
             output = read_from_file(actions_curr_path)
             assert curr_log[-1]['content'] == output, f'Bad resume! Check the log at {actions_curr_path}'
             
-        ###########################################################
-        #            Executability testing and self-improving     #
-        ###########################################################
         freezed_before_improv = freeze_global()
         while step < n_total_steps:
             comparator_instruction = None
@@ -453,17 +506,11 @@ class AvaTaR(ModelForQA):
                         print('parameter_dict', parameter_dict)
                         print('node_score_dict', node_score_dict)
 
-                    ###########################################################
-                    #                Check the format of the output           #
-                    ###########################################################
                     assert len(node_score_dict) == len(candidate_ids), f'The length of node_score_dict {len(node_score_dict)} is not equal to the length of candidate_ids {len(candidate_ids)}!'
                     assert scores.numel() == len(candidate_ids), f'The number of scores {scores.numel()} is not equal to the length of candidate_ids {len(candidate_ids)}!'
                     assert all([isinstance(v, float) or isinstance(v, int) for v in node_score_dict.values()]), f'The values of node_score_dict {node_score_dict} should be float or int!'
                     assert len(set(scores.tolist())) > 1 or len(node_score_dict) == 1, f'The scores in node_score_dict {node_score_dict} are all the same! Please avoid trivial solutions!'
 
-                    ###########################################################
-                    #             Evaluate the actions on the query              #
-                    ###########################################################
                     exec_eval[idx] = self.evaluate(
                         node_score_dict, torch.LongTensor(answer_ids), 
                         metrics=['hit@1', 'hit@5', 'recall@20', 'mrr']
@@ -479,9 +526,6 @@ class AvaTaR(ModelForQA):
                 self.APIs['debug_print'].disable()
 
                 query, candidate_ids = '', []
-                ###########################################################
-                #              Construct pos & neg queries                #
-                ###########################################################
                 pos_neg_queries = self.construct_pos_neg_queries(
                     qa_dataset, sampled_batch, exec_eval, batch_size, sel_metric, self.threshold
                     )
@@ -498,10 +542,6 @@ class AvaTaR(ModelForQA):
                 memory_bank.push('supervison_info', pos_neg_queries)
                 write_to_file(memory_bank_path, memory_bank.jsonable())
                 
-                ###########################################################
-                #               Evaluate the improved actions             # 
-                #       in the last step (before mem bank increase)       #
-                ###########################################################
                 try:
                     last_best_metric = copy.copy(best_metric)
                     save_path = osp.join(actions_output_dir, f'eval_action_step{step}.json')
@@ -532,13 +572,9 @@ class AvaTaR(ModelForQA):
                 else:
                     gap_from_last_improv += 1
 
-                # Raise exception at the end of this step
                 assert False, comparator_instruction
 
             except Exception as err:
-                ###########################################################
-                #                     Handle the error                    #
-                ###########################################################
                 exec_eval = {}
                 kb_schema_prompt = curr_log[0]['content']
                 last_actions = curr_log[-1]['content']
@@ -549,14 +585,11 @@ class AvaTaR(ModelForQA):
                     feedback_message = string_exec_error_handler(err, actions)
                 debug_message = self.APIs['debug_print'].get_written().strip(' \n')
                 improve_actions_prompt = self._get_prompt(name='improve_actions',
-                                                            feedback_message=feedback_message,
-                                                            debug_message=debug_message,
-                                                            query=query,
-                                                            candidate_ids=candidate_ids)
+                                                          feedback_message=feedback_message,
+                                                          debug_message=debug_message,
+                                                          query=query,
+                                                          candidate_ids=candidate_ids)
 
-                ###########################################################
-                #                 Format memory bank info                 #
-                ###########################################################
                 memory_info, last_actions_metric = '', ''
                 if len(memory_bank.action_performance):
                     action_performance = memory_bank.action_performance
@@ -574,26 +607,22 @@ class AvaTaR(ModelForQA):
                             break
                     
                     memory_info = f'The following information stores your memory to help you generate code better.\n' + \
-                                    f'These are the previous generated codes and their evaluation metrics on the validation queries:\n' + \
-                                    '\n'.join([f'#{i + 1}:\n' + 'code:\n' + '```python\n' + c + '```\n' + 'Metrics:\n' + 
-                                    '  Hit@1: ' + str(round(m["hit@1"], 4)) + '\n' + 
-                                    '  Hit@5: ' + str(round(m["hit@5"], 4)) + '\n' + 
-                                    '  Recall@20: ' + str(round(m["recall@20"], 4)) + '\n' + 
-                                    '  MRR: ' + str(round(m["mrr"], 4)) + '\n' for i, (c, m) in enumerate(zip(actions_mem, metrics_mem))])
+                                  f'These are the previous generated codes and their evaluation metrics on the validation queries:\n' + \
+                                  '\n'.join([f'#{i + 1}:\n' + 'code:\n' + '```python\n' + c + '```\n' + 'Metrics:\n' + 
+                                   '  Hit@1: ' + str(round(m["hit@1"], 4)) + '\n' + 
+                                   '  Hit@5: ' + str(round(m["hit@5"], 4)) + '\n' + 
+                                   '  Recall@20: ' + str(round(m["recall@20"], 4)) + '\n' + 
+                                   '  MRR: ' + str(round(m["mrr"], 4)) + '\n' for i, (c, m) in enumerate(zip(actions_mem, metrics_mem))])
                     if last_metric:
                         last_actions_metric = (f'By executing the code in your last message, the evaluation metrics on validation queries are:\n' + 
-                                                '  Hit@1: ' + str(last_metric["hit@1"]) + '\n' + 
-                                                '  Hit@5: ' + str(last_metric["hit@5"]) + '\n' + 
-                                                '  Recall@20: ' + str(m["recall@20"]) + '\n' + 
-                                                '  MRR: ' + str(last_metric["mrr"]) + '\n')
+                                               '  Hit@1: ' + str(last_metric["hit@1"]) + '\n' + 
+                                               '  Hit@5: ' + str(last_metric["hit@5"]) + '\n' + 
+                                               '  Recall@20: ' + str(m["recall@20"]) + '\n' + 
+                                               '  MRR: ' + str(last_metric["mrr"]) + '\n')
                 error_handle_log = [{"role": "user", "content": kb_schema_prompt + '\n' + memory_info}]
                 error_handle_log.append({"role": "assistant", "content": '```\n' + last_actions + '\n```'})
                 error_handle_log.append({"role": "user", "content": last_actions_metric + '\n' + improve_actions_prompt})
 
-                ########################################################### 
-                #                  Obtain improved program                #
-                #               or try reinitializing the actions         #
-                ###########################################################
                 if not added_superv_to_mem or gap_from_last_improv <= patience:
                     output = self.actor(error_handle_log)
                     if verbose:
@@ -621,9 +650,6 @@ class AvaTaR(ModelForQA):
 
             if step % 25 == 0 or step == n_total_steps:
                 test_save_path = osp.join(actions_output_dir, f'eval_metrics_test_topk{topk_test}_step{step}.json')
-                ###########################################################
-                #             Evalulation on the Testing dataset          #
-                ###########################################################
                 try:
                     best_param_dict = read_from_file(actions_best_param_path)
                     best_output = read_from_file(actions_best_path)
@@ -648,25 +674,23 @@ class AvaTaR(ModelForQA):
     def construct_pos_neg_queries(self, qa_dataset, 
                                   batch, exec_eval, 
                                   batch_size, sel_metric, threshold):
-
         sorted_idx = np.argsort([exec_eval[idx][sel_metric.lower()] for idx in batch])[::-1]
         sorted_idx = np.array(batch)[sorted_idx]
         sorted_queries = [qa_dataset[idx][0] for idx in sorted_idx]
         sorted_metric = [{'hit@1': exec_eval[idx]['hit@1'], 
-                            'hit@5': exec_eval[idx]['hit@5'],
-                            'recall@20': exec_eval[idx]['recall@20'], 
-                            'mrr': exec_eval[idx]['mrr']} for idx in sorted_idx
-                            ]
+                         'hit@5': exec_eval[idx]['hit@5'],
+                         'recall@20': exec_eval[idx]['recall@20'], 
+                         'mrr': exec_eval[idx]['mrr']} for idx in sorted_idx]
         pos_queries = [f'Query {i + 1}: {sorted_queries[i]}\n=>' + 
-                        '  Hit@1: ' + str(round(m['hit@1'], 4)) + 
-                        '  Hit@5: ' + str(round(m['hit@5'], 4)) + 
-                        '  Recall@20: ' + str(round(m['recall@20'], 3)) + 
-                        '  MRR: ' + str(round(m['mrr'], 4)) + '\n' for i, m in enumerate(sorted_metric) if m['hit@5'] > self.threshold]
+                       '  Hit@1: ' + str(round(m['hit@1'], 4)) + 
+                       '  Hit@5: ' + str(round(m['hit@5'], 4)) + 
+                       '  Recall@20: ' + str(round(m['recall@20'], 3)) + 
+                       '  MRR: ' + str(round(m['mrr'], 4)) + '\n' for i, m in enumerate(sorted_metric) if m['hit@5'] > self.threshold]
         neg_queries = [f'Query {i + 1}: {sorted_queries[i]}\n=>' + 
-                        '  Hit@1: ' + str(round(m['hit@1'], 4)) + 
-                        '  Hit@5: ' + str(round(m['hit@5'], 4)) + 
-                        '  Recall@20: ' + str(round(m['recall@20'], 3)) + 
-                        '  MRR: ' + str(round(m['mrr'], 4)) + '\n' for i, m in enumerate(sorted_metric) if m['hit@5'] <= self.threshold]
+                       '  Hit@1: ' + str(round(m['hit@1'], 4)) + 
+                       '  Hit@5: ' + str(round(m['hit@5'], 4)) + 
+                       '  Recall@20: ' + str(round(m['recall@20'], 3)) + 
+                       '  MRR: ' + str(round(m['mrr'], 4)) + '\n' for i, m in enumerate(sorted_metric) if m['hit@5'] <= self.threshold]
         if len(neg_queries) and len(pos_queries):
             neg_queries = neg_queries[-batch_size // 2:]
             pos_queries = pos_queries[:batch_size // 2]
@@ -674,8 +698,7 @@ class AvaTaR(ModelForQA):
             queries = pos_queries + neg_queries
             pos_queries = queries[:len(queries) // 2]
             neg_queries = queries[len(queries) // 2:]
-        pos_neg_queries = ['Positive examples:\n'] + pos_queries  + \
-                           ['Negative examples:\n'] + neg_queries
+        pos_neg_queries = ['Positive examples:\n'] + pos_queries + ['Negative examples:\n'] + neg_queries
         pos_neg_queries = '\n'.join(pos_neg_queries)
         return pos_neg_queries
         
@@ -688,7 +711,6 @@ class AvaTaR(ModelForQA):
                     save_path: str, 
                     topk: int = 50, 
                     n_eval: int = 50) -> Union[Dict[str, Any], Dict[str, float]]:
-
         if osp.exists(save_path):
             param_best = read_from_file(save_path)
             return param_best['param'], param_best['metric']
@@ -710,14 +732,13 @@ class AvaTaR(ModelForQA):
             split='val', topk=topk, n_eval=n_eval,
             save_path=osp.join(osp.dirname(save_path), f'val_eval_metric.json'),
             num_processes=self.num_processes
-            )
+        )
         param_search_eval = {'param': parameter_dict, 
                              'metric': search_eval, 
                              'n_eval': len(eval_csv)}
         write_to_file(save_path, param_search_eval)
         return param_search_eval['param'], param_search_eval['metric']
     
-        
     def get_eval_indices(self, 
                          qa_dataset: Any, 
                          split: str, 
@@ -725,11 +746,6 @@ class AvaTaR(ModelForQA):
                          group_idx: int, 
                          n_eval: int, 
                          query_indices: List[int] = None) -> List[int]:
-        """
-        1. Provide query_indices to evaluate on specific queries
-        2. Eval on test, if n_eval is -1, evaluate on all queries; otherwise eval on max n_eval queries
-        3. Evaluate on val, if n_eval is -1, evaluate on all queries; otherwise eval on max n_eval queries, with supplement from train
-        """
         assert split in ['val', 'test']
         if query_indices:
             indices = query_indices
@@ -763,9 +779,7 @@ class AvaTaR(ModelForQA):
                                 n_eval: int = -1, 
                                 save_path: str = None, 
                                 query_indices: List[int] = None) -> Union[Dict[str, float], pd.DataFrame]:
-        
-        indices = self.get_eval_indices(qa_dataset, split, use_group,
-                                        group_idx, n_eval, query_indices)
+        indices = self.get_eval_indices(qa_dataset, split, use_group, group_idx, n_eval, query_indices)
         if save_path:
             json_save_path = save_path
             file_name = osp.basename(save_path).split('.')[0]
@@ -792,8 +806,6 @@ class AvaTaR(ModelForQA):
             
             success = False
             for _ in range(3):
-                # While it is unlikely to fail during eval, we still need to 
-                # handle the error due to api connection error, oom error, etc.
                 try:
                     pred_dict = get_node_score_dict(query, candidate_ids, **parameter_dict)
                     success = True
@@ -858,7 +870,7 @@ class AvaTaR(ModelForQA):
         eval_indices = self.get_eval_indices(qa_dataset, split, use_group, group_idx, n_eval, query_indices=None)
         total_size = len(eval_indices)
         chunk_ranges = AvaTaR.split_dataset_indices(total_size=total_size, num_chunks=num_processes)
-        print(f'Parallel evaluting on {total_size} queries....')
+        print(f'Parallel evaluating on {total_size} queries....')
 
         for chunk_range, chunk_path in zip(chunk_ranges, chunk_indices_pathss):
             query_indices = [eval_indices[idx] for idx in chunk_range]
@@ -965,7 +977,6 @@ class AvaTaR(ModelForQA):
             for i in range(len(group)):
                 if query_idx in group[i]['query_idx']:
                     return i
-        
         return None
 
     def save_group(self, group: Dict[int, Any], surfix: str) -> None:
@@ -1032,7 +1043,6 @@ class AvaTaR(ModelForQA):
                        split: str = 'train', 
                        batch_size: int = 100, 
                        n_init_examples: int = 200) -> Dict[int, Any]:
-
         path_bootstrap = osp.join(self.output_dir, '..', 'group_query_bootstrap.json')
         path_split = osp.join(self.output_dir, '..', f'group_query_{split}.json')
 
@@ -1040,7 +1050,6 @@ class AvaTaR(ModelForQA):
             return self.load_group(surfix=split)[0]
 
         if split == 'train':
-            ################### Initialize group ##################
             if not osp.exists(path_bootstrap):
                 train_indices = qa_dataset.get_idx_split()['train'].tolist()
                 indices = random.sample(train_indices, n_init_examples)
@@ -1059,7 +1068,6 @@ class AvaTaR(ModelForQA):
                 n_overlap += len(set(group_initial[i]['query_idx']).intersection(set(group_bootstrap[i]['query_idx'])))
             print(f'Overlap: {n_overlap} / {n_total} = ', n_overlap / n_total)
 
-            ############# Categorize None of the above again ############
             group_clear_none = copy.deepcopy(group_bootstrap)
             self.save_group(group_clear_none, surfix=split)
             group_clear_none.pop(len(group_clear_none) - 1)
@@ -1074,7 +1082,6 @@ class AvaTaR(ModelForQA):
                 group_split = self.load_group(surfix=split)[0]
                 unassigned_idx_last = group_split[len(group_split) - 1]['query_idx']
 
-                ############# Add new groups from None of the above ############
                 if len(unassigned_idx_last):
                     group_new = self.initialize_group(qa_dataset, unassigned_idx_last, add_none=False, save_to='new')
                     group_new = {key + len(group_split) - 1: group_new[key] for key in group_new.keys()}
@@ -1098,8 +1105,6 @@ class AvaTaR(ModelForQA):
                 split: str = 'test',
                 seed: int = 0,
                 **kwargs: Any) -> Dict[int, float]:
-
-        ############## Get prompt for group classification ##############
         group_id = self.get_group_id(query_id, split=split)
         print('group_id', group_id)
         actions_best, param_best = self._load_actions(group_id, seed=seed)
@@ -1108,7 +1113,6 @@ class AvaTaR(ModelForQA):
         fail_exec, actions, _ = self._exec_actions_from_output(actions_best)
         globals().update(self.APIs)
         
-        ############## Use VSS to filter ##############
         initial_score_dict, candidate_ids = self.get_parent_topk(query, query_id, topk=self.topk_test)
 
         get_node_score_dict = globals().get('get_node_score_dict')
