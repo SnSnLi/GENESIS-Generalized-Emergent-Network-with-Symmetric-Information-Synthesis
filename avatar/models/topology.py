@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from emergence import MultiHeadAttention, EmergenceCore, BidirectionalEmergenceCore
+from .base_modules import MultiHeadAttention, EmergenceCore, BidirectionalEmergenceCore
 
 class PhaseMapper(nn.Module):
     def __init__(self, dim):
